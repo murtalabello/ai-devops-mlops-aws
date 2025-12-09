@@ -1,27 +1,175 @@
-name: CI with AI DevOps Assistant
+name: CI/CD - Build and Deploy
 
 on:
   push:
     branches: [ "main" ]
+    paths:
+      - 'devops_assistant/**'
+      - 'rag_service/**'
+      - 'mlops_pipeline/**'
+      - 'infra/**'
+      - '.github/workflows/ci.yml'
+
+permissions:
+  id-token: write
+  contents: read
 
 jobs:
-  build:
+  lint-and-test:
     runs-on: ubuntu-latest
-
+    
     steps:
       - uses: actions/checkout@v4
-
-      - name: Run tests (simulate failure)
-        id: build_step
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      
+      - name: Install linting tools
         run: |
-          echo "Simulating failure..."
-          echo "This is a fake log line" > build.log
-          exit 1
+          pip install black flake8 pylint
+      
+      - name: Lint Python code
+        run: |
+          black --check . || true
+          flake8 . || true
+      
+      - name: Run security scan
+        run: |
+          pip install bandit
+          bandit -r devops_assistant rag_service mlops_pipeline -f json -o bandit-report.json || true
+      
+      - name: Archive security report
+        uses: actions/upload-artifact@v4
+        with:
+          name: bandit-report
+          path: bandit-report.json
 
-      - name: Send logs to AI DevOps Assistant
+  build-lambdas:
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Build devops-assistant Lambda
+        run: |
+          mkdir -p build/devops-assistant
+          pip install -r devops_assistant/requirements.txt -t build/devops-assistant/
+          cp devops_assistant/lambda_function.py build/devops-assistant/
+          cd build/devops-assistant && zip -r ../devops-assistant.zip . && cd ../..
+      
+      - name: Build rag-service Lambda
+        run: |
+          mkdir -p build/rag-service
+          pip install -r rag_service/requirements.txt -t build/rag-service/
+          cp rag_service/lambda_function.py build/rag-service/
+          cd build/rag-service && zip -r ../rag-service.zip . && cd ../..
+      
+      - name: Upload Lambda artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: lambda-artifacts
+          path: build/*.zip
+
+  deploy-to-aws:
+    runs-on: ubuntu-latest
+    needs: build-lambdas
+    if: github.ref == 'refs/heads/main'
+    environment: production
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+      
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.5.0
+      
+      - name: Download Lambda artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: lambda-artifacts
+          path: build/
+      
+      - name: Deploy infrastructure
+        run: |
+          cd infra
+          terraform init -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+                        -backend-config="key=ai-devops-prod.tfstate" \
+                        -backend-config="region=${{ secrets.AWS_REGION }}"
+          terraform plan -var-file="environments/prod.tfvars" -out=tfplan
+          terraform apply -auto-approve tfplan
+        env:
+          TF_VAR_openai_api_key: ${{ secrets.OPENAI_API_KEY }}
+      
+      - name: Deploy Lambda functions
+        run: |
+          bash scripts/build-lambda.sh devops_assistant $LAMBDA_ROLE_ARN prod
+          bash scripts/build-lambda.sh rag_service $LAMBDA_ROLE_ARN prod
+        env:
+          LAMBDA_ROLE_ARN: ${{ secrets.AWS_LAMBDA_ROLE_ARN }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      
+      - name: Create API Gateway endpoints
+        run: |
+          DEVOPS_API=$(bash scripts/create-api-gateway.sh devops-assistant-prod devops-assistant prod)
+          RAG_API=$(bash scripts/create-api-gateway.sh rag-service-prod rag-service prod)
+          
+          echo "DEVOPS_API_URL=$DEVOPS_API" >> $GITHUB_ENV
+          echo "RAG_API_URL=$RAG_API" >> $GITHUB_ENV
+      
+      - name: Run smoke tests
+        run: |
+          bash scripts/smoke-tests.sh "${{ env.DEVOPS_API_URL }}" "${{ env.RAG_API_URL }}"
+      
+      - name: Send deployment notification
+        if: success()
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          webhook-url: ${{ secrets.SLACK_WEBHOOK }}
+          payload: |
+            {
+              "text": "✅ AI DevOps MLOps deployment successful!",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Deployment Summary*\n• DevOps Assistant: ${{ env.DEVOPS_API_URL }}\n• RAG Service: ${{ env.RAG_API_URL }}\n• Region: ${{ secrets.AWS_REGION }}"
+                  }
+                }
+              ]
+            }
+      
+      - name: Notify on failure
         if: failure()
-        run: |
-          LOG_CONTENT=$(cat build.log | sed 's/"/\\"/g' | sed "s/'/\"/g")
-          curl -X POST "${{ secrets.AI_ASSISTANT_URL }}" \
-            -H "Content-Type: application/json" \
-            -d "{\"log\": \"${LOG_CONTENT}\"}"
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          webhook-url: ${{ secrets.SLACK_WEBHOOK }}
+          payload: |
+            {
+              "text": "❌ Deployment failed",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Deployment Failed*\nCheck logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                  }
+                }
+              ]
+            }

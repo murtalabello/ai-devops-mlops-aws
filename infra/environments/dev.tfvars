@@ -1,0 +1,5 @@
+region                      = "us-east-1"
+ml_artifacts_bucket         = "ai-devops-ml-artifacts-dev"
+rag_docs_bucket             = "ai-devops-rag-docs-dev"
+rag_table_name              = "rag-chunks-dev"
+devops_assistant_package    = "devops-assistant-dev.zip"

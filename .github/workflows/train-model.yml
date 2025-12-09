@@ -1,35 +1,103 @@
-name: Train ML model and upload to S3
+name: MLOps - Train & Deploy Model
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 3 * * *" # daily at 03:00 UTC
+    - cron: "0 3 * * *" # Daily at 03:00 UTC
+
+permissions:
+  id-token: write
+  contents: read
 
 jobs:
-  train-and-upload:
+  train-model:
     runs-on: ubuntu-latest
-
+    
     steps:
       - uses: actions/checkout@v4
-
+      
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
-
-      - name: Install deps
+          python-version: '3.11'
+          cache: 'pip'
+      
+      - name: Install dependencies
         run: |
           pip install -r mlops_pipeline/requirements.txt
-
+      
       - name: Train model
+        id: train
         run: |
           python mlops_pipeline/train.py
+          echo "model_version=$(date +%Y%m%d_%H%M%S)" >> $GITHUB_OUTPUT
+      
+      - name: Archive model artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-artifacts-${{ steps.train.outputs.model_version }}
+          path: artifacts/
 
+  publish-model:
+    runs-on: ubuntu-latest
+    needs: train-model
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Download model artifacts
+        uses: actions/download-artifact@v4
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+      
       - name: Upload model to S3
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
-          S3_BUCKET: ${{ secrets.ML_ARTIFACTS_BUCKET }}
         run: |
-          aws s3 cp artifacts/model.pkl s3://$S3_BUCKET/models/model-$(date +%Y%m%d%H%M%S).pkl
+          cd $(find . -name "model-artifacts-*" -type d | head -1)
+          aws s3 cp model.pkl s3://${{ secrets.ML_ARTIFACTS_BUCKET }}/models/model-$(date +%Y%m%d_%H%M%S).pkl
+          aws s3 cp metrics.txt s3://${{ secrets.ML_ARTIFACTS_BUCKET }}/metrics/metrics-$(date +%Y%m%d_%H%M%S).txt
+      
+      - name: Update SageMaker Model (optional)
+        if: false  # Enable when using SageMaker
+        run: |
+          aws sagemaker describe-model --model-name ai-devops-model || echo "Model not found"
+      
+      - name: Send success notification
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          webhook-url: ${{ secrets.SLACK_WEBHOOK }}
+          payload: |
+            {
+              "text": "✅ Model training and deployment successful!",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Model Training Complete*\n• S3 Bucket: ${{ secrets.ML_ARTIFACTS_BUCKET }}\n• Timestamp: $(date)"
+                  }
+                }
+              ]
+            }
+      
+      - name: Send failure notification
+        if: failure()
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          webhook-url: ${{ secrets.SLACK_WEBHOOK }}
+          payload: |
+            {
+              "text": "❌ Model training failed",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Training Failed*\nCheck logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                  }
+                }
+              ]
+            }
