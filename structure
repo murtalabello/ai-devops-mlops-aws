@@ -1,0 +1,18 @@
+ai-devops-mlops-aws/
+├── devops_assistant/
+│   ├── lambda_function.py
+│   ├── requirements.txt
+├── mlops_pipeline/
+│   ├── train.py
+│   ├── requirements.txt
+├── rag_service/
+│   ├── lambda_function.py
+│   ├── requirements.txt
+├── infra/
+│   ├── main.tf
+│   ├── variables.tf
+│   ├── outputs.tf
+├── .github/workflows/
+│   ├── ci.yml
+│   ├── train-model.yml
+└── README.md

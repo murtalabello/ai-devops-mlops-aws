@@ -1,0 +1,27 @@
+name: CI with AI DevOps Assistant
+
+on:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run tests (simulate failure)
+        id: build_step
+        run: |
+          echo "Simulating failure..."
+          echo "This is a fake log line" > build.log
+          exit 1
+
+      - name: Send logs to AI DevOps Assistant
+        if: failure()
+        run: |
+          LOG_CONTENT=$(cat build.log | sed 's/"/\\"/g' | sed "s/'/\"/g")
+          curl -X POST "${{ secrets.AI_ASSISTANT_URL }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"log\": \"${LOG_CONTENT}\"}"
