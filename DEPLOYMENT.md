@@ -1,31 +1,14 @@
-# Automated Deployment Guide
+# MLOps Pipeline - Manual Training Guide
 
-This project uses GitHub Actions pipelines to automatically build, test, and deploy the AI DevOps MLOps application to AWS.
+This project uses a manual GitHub Actions workflow to train and deploy ML models to AWS.
 
 ## Pipeline Overview
 
-### 1. **CI/CD Pipeline** (`.github/workflows/ci.yml`)
-Triggered on push to `main` branch:
-- **Lint & Test**: Python linting, security scanning (bandit)
-- **Build Lambdas**: Package devops-assistant and rag-service functions
-- **Deploy to AWS**: 
-  - Initialize and apply Terraform
-  - Deploy Lambda functions
-  - Create API Gateway endpoints
-  - Run smoke tests
-  - Send Slack notifications
-
-### 2. **MLOps Pipeline** (`.github/workflows/train-model.yml`)
-Scheduled daily at 03:00 UTC (or manual trigger):
+### **MLOps Pipeline** (`.github/workflows/train-model.yml`)
+Manual trigger (optional daily schedule):
 - **Train Model**: Execute scikit-learn training pipeline
 - **Publish Model**: Upload artifacts to S3, archive metrics
 - **Notifications**: Slack updates on success/failure
-
-### 3. **Manual Deploy Workflow** (`.github/workflows/deploy.yml`)
-Manual trigger with environment selection (dev/staging/prod):
-- Allows choosing target environment
-- Runs full deployment pipeline
-- Notifications on completion
 
 ## Setup Instructions
 
@@ -36,14 +19,11 @@ Go to **Settings → Secrets and variables → Actions** and add:
 ```
 AWS_REGION                  = us-east-1
 AWS_ROLE_ARN               = arn:aws:iam::ACCOUNT_ID:role/GitHubActionsRole
-AWS_LAMBDA_ROLE_ARN        = arn:aws:iam::ACCOUNT_ID:role/ai_platform_lambda_role
-TF_STATE_BUCKET            = terraform-state-ACCOUNT_ID
-OPENAI_API_KEY             = sk-...
 ML_ARTIFACTS_BUCKET        = ai-devops-ml-artifacts-prod
 SLACK_WEBHOOK              = https://hooks.slack.com/...
 ```
 
-### Step 2: Create AWS IAM Roles
+### Step 2: Create AWS IAM Role
 
 **GitHub Actions Role** (for OIDC federation):
 
@@ -68,149 +48,118 @@ aws iam create-role --role-name GitHubActionsRole \
     }]
   }'
 
-# Attach policies
+# Attach S3 policy
 aws iam attach-role-policy --role-name GitHubActionsRole \
-  --policy-arn arn:aws:iam::aws:policy/AdministratorAccess
-```
-
-**Lambda Role** (for function execution):
-
-```bash
-aws iam create-role --role-name ai_platform_lambda_role \
-  --assume-role-policy-document '{
-    "Version": "2012-10-17",
-    "Statement": [{
-      "Effect": "Allow",
-      "Principal": {"Service": "lambda.amazonaws.com"},
-      "Action": "sts:AssumeRole"
-    }]
-  }'
-
-# Attach policies for S3, DynamoDB, CloudWatch
-aws iam attach-role-policy --role-name ai_platform_lambda_role \
   --policy-arn arn:aws:iam::aws:policy/AmazonS3FullAccess
-
-aws iam attach-role-policy --role-name ai_platform_lambda_role \
-  --policy-arn arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess
-
-aws iam attach-role-policy --role-name ai_platform_lambda_role \
-  --policy-arn arn:aws:iam::aws:policy/CloudWatchLogsFullAccess
 ```
 
-### Step 3: Create Terraform State S3 Bucket
+### Step 3: Create S3 Bucket for Model Artifacts
 
 ```bash
-ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-
-aws s3 mb s3://terraform-state-${ACCOUNT_ID} \
-  --region us-east-1 \
-  --create-bucket-configuration LocationConstraint=us-east-1
+aws s3 mb s3://ai-devops-ml-artifacts-prod --region us-east-1
 
 # Enable versioning
 aws s3api put-bucket-versioning \
-  --bucket terraform-state-${ACCOUNT_ID} \
+  --bucket ai-devops-ml-artifacts-prod \
   --versioning-configuration Status=Enabled
 ```
 
-### Step 4: Push to Trigger Deployment
+## Triggering Manual Training
 
+### Via GitHub UI:
+1. Go to **Actions** → **MLOps - Train & Deploy Model**
+2. Click **Run workflow**
+3. Select branch: `main`
+4. Click **Run workflow**
+
+### Via GitHub CLI:
 ```bash
-git add .
-git commit -m "Deploy automated pipeline"
-git push origin main
+gh workflow run train-model.yml --ref main
 ```
 
-This will trigger the CI/CD pipeline automatically!
+### Via API:
+```bash
+curl -X POST \
+  -H "Authorization: token YOUR_GITHUB_TOKEN" \
+  -H "Accept: application/vnd.github.v3+raw" \
+  https://api.github.com/repos/murtalabello/ai-devops-mlops-aws/actions/workflows/train-model.yml/dispatches \
+  -d '{"ref":"main"}'
+```
+
+## Optional: Enable Daily Scheduling
+
+To run training automatically every day at 03:00 UTC, the schedule is already configured in the workflow:
+
+```yaml
+schedule:
+  - cron: "0 3 * * *"  # Daily at 03:00 UTC
+```
+
+To disable: comment out or remove this section from `.github/workflows/train-model.yml`
+
+## Monitoring Training
+
+### GitHub Actions Logs:
+1. Go to **Actions** tab → **MLOps - Train & Deploy Model**
+2. Click the latest workflow run
+3. Expand **train-model** or **publish-model** jobs to view logs
+
+### AWS S3 Artifacts:
+```bash
+# List all trained models
+aws s3 ls s3://ai-devops-ml-artifacts-prod/models/ --recursive
+
+# List all metrics
+aws s3 ls s3://ai-devops-ml-artifacts-prod/metrics/ --recursive
+
+# Download latest model
+aws s3 cp s3://ai-devops-ml-artifacts-prod/models/ ./ --recursive --exclude "*" --include "model-*.pkl"
+```
+
+### Slack Notifications:
+Training success/failure will be posted to your Slack channel automatically.
+
+## Training Pipeline Details
+
+### What Gets Trained (`mlops_pipeline/train.py`):
+- **Dataset**: Diabetes dataset (scikit-learn)
+- **Model**: Linear Regression
+- **Train/Test Split**: 80/20
+- **Output**: `artifacts/model.pkl` + `artifacts/metrics.txt`
+
+### What Gets Uploaded to S3:
+- Model: `s3://ai-devops-ml-artifacts-prod/models/model-YYYYMMDD_HHMMSS.pkl`
+- Metrics: `s3://ai-devops-ml-artifacts-prod/metrics/metrics-YYYYMMDD_HHMMSS.txt`
 
 ## Local Testing
 
-### Run deployment script locally:
-
+### Train locally without AWS:
 ```bash
-# Set environment variables
-export AWS_REGION=us-east-1
-export ENVIRONMENT=dev
-export OPENAI_API_KEY=sk-...
-
-# Make scripts executable
-chmod +x scripts/*.sh
-
-# Run deployment
-bash scripts/deploy.sh
+pip install -r mlops_pipeline/requirements.txt
+python mlops_pipeline/train.py
 ```
 
-### Run smoke tests:
+Outputs: `artifacts/model.pkl` and `artifacts/metrics.txt`
 
+### Upload artifacts to S3 manually:
 ```bash
-bash scripts/smoke-tests.sh \
-  "https://API_ID.execute-api.us-east-1.amazonaws.com/dev/" \
-  "https://API_ID.execute-api.us-east-1.amazonaws.com/dev/"
-```
-
-### Teardown (destroy resources):
-
-```bash
-bash scripts/teardown.sh dev
-```
-
-## Pipeline Variables
-
-### In `infra/environments/dev.tfvars`:
-- `region`: AWS region
-- `ml_artifacts_bucket`: S3 bucket for ML models
-- `rag_docs_bucket`: S3 bucket for RAG documents
-- `rag_table_name`: DynamoDB table name
-- `devops_assistant_package`: Lambda package name
-
-## Monitoring & Logs
-
-### GitHub Actions Logs:
-- Go to **Actions** tab → click workflow run → view logs
-
-### AWS CloudWatch Logs:
-```bash
-# DevOps Assistant Lambda
-aws logs tail /aws/lambda/devops-assistant-prod --follow
-
-# RAG Service Lambda
-aws logs tail /aws/lambda/rag-service-prod --follow
-```
-
-### AWS Cost Monitoring:
-```bash
-aws ce get-cost-and-usage \
-  --time-period Start=2025-01-01,End=2025-01-31 \
-  --granularity MONTHLY \
-  --metrics BlendedCost \
-  --group-by Type=DIMENSION,Key=SERVICE
+aws s3 cp artifacts/model.pkl s3://ai-devops-ml-artifacts-prod/models/
+aws s3 cp artifacts/metrics.txt s3://ai-devops-ml-artifacts-prod/metrics/
 ```
 
 ## Troubleshooting
 
 | Issue | Solution |
 |-------|----------|
-| Pipeline fails on Terraform | Check TF state bucket exists and role has permissions |
-| Lambda deployment fails | Verify AWS_LAMBDA_ROLE_ARN exists and has S3/DynamoDB access |
-| API Gateway not responding | Check Lambda permission for API Gateway principal |
-| Smoke tests timeout | Verify security groups allow outbound HTTPS |
-| OpenAI API errors | Validate OPENAI_API_KEY is correct and has quota |
-
-## Rollback
-
-To rollback to previous deployment:
-
-```bash
-cd infra
-terraform destroy -auto-approve -var-file="environments/prod.tfvars"
-# Or restore from S3 state backup
-aws s3 cp s3://terraform-state-ACCOUNT_ID/ai-devops-prod-backup.tfstate ./terraform.tfstate
-terraform apply
-```
+| Workflow permission denied | Check AWS_ROLE_ARN secret is correct and role has S3 access |
+| S3 upload fails | Verify ML_ARTIFACTS_BUCKET exists and role can write to it |
+| Slack notifications not received | Check SLACK_WEBHOOK URL is valid and webhook is active |
+| Training script fails | Check Python dependencies in `mlops_pipeline/requirements.txt` |
 
 ## Next Steps
 
-- [ ] Set up CloudWatch dashboards for monitoring
-- [ ] Integrate with PagerDuty for on-call alerting
-- [ ] Add automated cost optimization checks
-- [ ] Enable canary deployments for safer rollouts
-- [ ] Set up database backups and disaster recovery
+- [ ] Set up model versioning and tagging strategy
+- [ ] Add model evaluation metrics and performance tracking
+- [ ] Implement model registry (SageMaker Model Registry)
+- [ ] Add retraining triggers based on data drift
+- [ ] Set up automated model deployments to SageMaker endpoints
