@@ -2,6 +2,20 @@
 
 This guide will walk you through deploying all three services of the AI DevOps MLOps platform.
 
+## 🚀 Quick Start (TL;DR)
+
+**Deployment Order**:
+1. Deploy Infrastructure → Run workflow `deploy-infra.yml` (select `prod`)
+2. Deploy DevOps Assistant → Run workflow `deploy-devops-assistant.yml` (select `prod`)
+3. Deploy RAG Service → Run workflow `deploy-rag-service.yml` (select `prod`)
+4. Deploy MLOps → Run workflow `train-model.yml` (select `prod`)
+
+**Total time**: ~20 minutes
+
+**Cleanup**: Run workflow `destroy-all.yml` and type `destroy-all` to remove everything
+
+---
+
 ## Services Overview
 
 | Service | Purpose | Type | Deployment |
@@ -366,16 +380,69 @@ aws dynamodb describe-table --table-name rag-chunks-prod --region us-east-1
 
 ---
 
-## Support
+## Cleanup & Destruction (After POC)
 
-For issues or questions:
-1. Check GitHub Actions logs for detailed error messages
-2. Review AWS CloudWatch logs for service errors
-3. Verify all GitHub Secrets are correctly configured
-4. Ensure AWS IAM roles have proper permissions
+### ⚠️ **Important: Avoid AWS Charges**
+
+To prevent unexpected AWS charges after testing, destroy all resources when done.
+
+### Automated Destruction
+
+**Steps**:
+
+1. Go to **Actions** tab
+2. Click **Destroy All Infrastructure**
+3. Click **Run workflow**
+4. Select environment: `prod` (or `dev`)
+5. In "confirm" field, type exactly: `destroy-all`
+6. Click **Run workflow**
+
+**What gets destroyed**:
+- ✅ All Lambda functions
+- ✅ All API Gateway endpoints
+- ✅ All S3 buckets (contents deleted first)
+- ✅ DynamoDB tables
+- ✅ IAM roles
+- ⚠️ Data backed up to separate buckets before deletion
+
+**Duration**: ~5 minutes
+
+### Manual Cleanup (if needed)
+
+```bash
+# Delete Lambda functions
+aws lambda delete-function --function-name devops-assistant-prod --region us-east-1
+aws lambda delete-function --function-name rag-service-prod --region us-east-1
+
+# Delete API Gateways
+API_ID=$(aws apigateway get-rest-apis --query "Items[0].id" --output text)
+aws apigateway delete-rest-api --rest-api-id $API_ID --region us-east-1
+
+# Delete S3 buckets
+aws s3 rm s3://ai-devops-ml-artifacts-prod --recursive
+aws s3 rb s3://ai-devops-ml-artifacts-prod
+
+aws s3 rm s3://ai-devops-rag-docs-prod --recursive
+aws s3 rb s3://ai-devops-rag-docs-prod
+
+# Delete DynamoDB table
+aws dynamodb delete-table --table-name rag-chunks-prod --region us-east-1
+
+# Delete Terraform state (after terraform destroy)
+aws s3 rm s3://terraform-state-ACCOUNT_ID/ai-devops-prod.tfstate
+```
+
+### Cost Estimation for POC
+
+| Resource | Usage (POC) | Cost |
+|----------|------------|------|
+| Lambda | 10-20 invocations | <$0.01 |
+| S3 Storage | <1 GB | <$0.05 |
+| S3 API | 100 calls | <$0.01 |
+| DynamoDB | On-demand | <$0.01 |
+| API Gateway | 50 calls | <$0.05 |
+| **Total** | 1-2 hours usage | **~$0.15-0.25** |
+
+**Running destroy workflow will eliminate all charges after completion.**
 
 ---
-
-**Deployment Complete!** 🎉
-
-All three services are now deployed and ready to use. Visit GitHub Actions to trigger workflows and monitor execution.

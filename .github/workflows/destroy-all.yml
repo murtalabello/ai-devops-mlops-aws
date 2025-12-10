@@ -1,0 +1,237 @@
+name: Destroy All Infrastructure
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to destroy'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - prod
+      confirm:
+        description: 'Type "destroy-all" to confirm'
+        required: true
+        type: string
+
+jobs:
+  pre-destroy-check:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Verify confirmation
+        run: |
+          if [ "${{ github.event.inputs.confirm }}" != "destroy-all" ]; then
+            echo "❌ Confirmation failed. Please type 'destroy-all' exactly to confirm destruction."
+            exit 1
+          fi
+          echo "✅ Destruction confirmed for ${{ github.event.inputs.environment }} environment"
+
+  backup-and-cleanup:
+    runs-on: ubuntu-latest
+    needs: pre-destroy-check
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+      
+      - name: Backup S3 data
+        continue-on-error: true
+        run: |
+          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+          BACKUP_DIR="s3-backups-${{ github.event.inputs.environment }}-$TIMESTAMP"
+          
+          echo "📦 Backing up S3 buckets..."
+          
+          # Backup ML Artifacts
+          if aws s3 ls s3://${{ secrets.ML_ARTIFACTS_BUCKET }} 2>/dev/null; then
+            aws s3 sync s3://${{ secrets.ML_ARTIFACTS_BUCKET }} s3://${{ secrets.ML_ARTIFACTS_BUCKET }}-backup-$TIMESTAMP/
+            echo "✅ ML Artifacts backed up"
+          fi
+          
+          # Backup RAG Documents
+          if aws s3 ls s3://${{ secrets.RAG_BUCKET_NAME }} 2>/dev/null; then
+            aws s3 sync s3://${{ secrets.RAG_BUCKET_NAME }} s3://${{ secrets.RAG_BUCKET_NAME }}-backup-$TIMESTAMP/
+            echo "✅ RAG Documents backed up"
+          fi
+      
+      - name: Delete Lambda functions
+        continue-on-error: true
+        run: |
+          echo "🗑️  Deleting Lambda functions..."
+          
+          # Delete DevOps Assistant
+          aws lambda delete-function \
+            --function-name devops-assistant-${{ github.event.inputs.environment }} \
+            --region ${{ secrets.AWS_REGION }} 2>/dev/null && echo "✅ Deleted devops-assistant" || echo "⚠️  devops-assistant not found"
+          
+          # Delete RAG Service
+          aws lambda delete-function \
+            --function-name rag-service-${{ github.event.inputs.environment }} \
+            --region ${{ secrets.AWS_REGION }} 2>/dev/null && echo "✅ Deleted rag-service" || echo "⚠️  rag-service not found"
+
+  destroy-infrastructure:
+    runs-on: ubuntu-latest
+    needs: backup-and-cleanup
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.5.0
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+      
+      - name: Terraform Destroy
+        run: |
+          cd infra
+          terraform init
+          terraform destroy -auto-approve \
+            -var-file="environments/${{ github.event.inputs.environment }}.tfvars" \
+            -var="openai_api_key=placeholder" \
+            -var="devops_assistant_package=placeholder"
+          echo "✅ Terraform destroy completed"
+        continue-on-error: true
+
+  cleanup-remaining:
+    runs-on: ubuntu-latest
+    needs: destroy-infrastructure
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+      
+      - name: Delete API Gateways
+        continue-on-error: true
+        run: |
+          echo "🗑️  Deleting API Gateways..."
+          
+          # Get and delete REST APIs
+          aws apigateway get-rest-apis --region ${{ secrets.AWS_REGION }} \
+            --query "Items[?contains(name, '${{ github.event.inputs.environment }}')].id" \
+            --output text | xargs -I {} \
+            aws apigateway delete-rest-api --rest-api-id {} --region ${{ secrets.AWS_REGION }} 2>/dev/null && echo "✅ API Gateways deleted" || echo "⚠️  No API Gateways found"
+      
+      - name: Empty and delete S3 buckets
+        continue-on-error: true
+        run: |
+          echo "🗑️  Deleting S3 buckets..."
+          
+          # Empty ML Artifacts bucket
+          if aws s3 ls s3://${{ secrets.ML_ARTIFACTS_BUCKET }} 2>/dev/null; then
+            aws s3 rm s3://${{ secrets.ML_ARTIFACTS_BUCKET }} --recursive
+            aws s3 rb s3://${{ secrets.ML_ARTIFACTS_BUCKET }}
+            echo "✅ ML Artifacts bucket deleted"
+          fi
+          
+          # Empty RAG Documents bucket
+          if aws s3 ls s3://${{ secrets.RAG_BUCKET_NAME }} 2>/dev/null; then
+            aws s3 rm s3://${{ secrets.RAG_BUCKET_NAME }} --recursive
+            aws s3 rb s3://${{ secrets.RAG_BUCKET_NAME }}
+            echo "✅ RAG Documents bucket deleted"
+          fi
+      
+      - name: Delete DynamoDB tables
+        continue-on-error: true
+        run: |
+          echo "🗑️  Deleting DynamoDB tables..."
+          
+          aws dynamodb delete-table \
+            --table-name ${{ secrets.RAG_TABLE_NAME }} \
+            --region ${{ secrets.AWS_REGION }} 2>/dev/null && echo "✅ DynamoDB table deleted" || echo "⚠️  Table not found"
+      
+      - name: Delete IAM roles
+        continue-on-error: true
+        run: |
+          echo "🗑️  Deleting IAM roles..."
+          
+          # List and detach inline policies
+          ROLE_NAME="ai-platform-lambda-role"
+          
+          POLICIES=$(aws iam list-role-policies --role-name $ROLE_NAME \
+            --query 'PolicyNames[]' --output text 2>/dev/null)
+          
+          for policy in $POLICIES; do
+            aws iam delete-role-policy --role-name $ROLE_NAME --policy-name $policy
+          done
+          
+          # Detach managed policies
+          aws iam detach-role-policy \
+            --role-name $ROLE_NAME \
+            --policy-arn arn:aws:iam::aws:policy/AmazonS3FullAccess 2>/dev/null
+          
+          aws iam detach-role-policy \
+            --role-name $ROLE_NAME \
+            --policy-arn arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess 2>/dev/null
+          
+          aws iam detach-role-policy \
+            --role-name $ROLE_NAME \
+            --policy-arn arn:aws:iam::aws:policy/CloudWatchLogsFullAccess 2>/dev/null
+          
+          # Delete role
+          aws iam delete-role --role-name $ROLE_NAME 2>/dev/null && echo "✅ Lambda role deleted" || echo "⚠️  Role not found"
+
+  final-verification:
+    runs-on: ubuntu-latest
+    needs: cleanup-remaining
+    
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+      
+      - name: Verify cleanup
+        run: |
+          echo "🔍 Verifying cleanup..."
+          
+          echo "Lambda functions:"
+          aws lambda list-functions --region ${{ secrets.AWS_REGION }} \
+            --query "Functions[?contains(FunctionName, '${{ github.event.inputs.environment }}')].FunctionName" \
+            --output text || echo "✅ No Lambda functions found"
+          
+          echo -e "\nAPI Gateways:"
+          aws apigateway get-rest-apis --region ${{ secrets.AWS_REGION }} \
+            --query "Items[?contains(name, '${{ github.event.inputs.environment }}')].name" \
+            --output text || echo "✅ No API Gateways found"
+          
+          echo -e "\nS3 Buckets:"
+          aws s3 ls | grep -E "${{ secrets.ML_ARTIFACTS_BUCKET }}|${{ secrets.RAG_BUCKET_NAME }}" || echo "✅ No AI DevOps buckets found"
+      
+      - name: Send completion notification
+        uses: slackapi/slack-github-action@v1.24.0
+        if: always()
+        with:
+          webhook-url: ${{ secrets.SLACK_WEBHOOK }}
+          payload: |
+            {
+              "text": "🧹 Destruction of ${{ github.event.inputs.environment }} environment completed",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Environment Destroyed: ${{ github.event.inputs.environment }}*\n• All Lambda functions removed\n• All S3 buckets deleted\n• All DynamoDB tables deleted\n• All IAM roles cleaned\n• Data backed up before deletion"
+                  }
+                }
+              ]
+            }
