@@ -13,6 +13,12 @@ provider "aws" {
   region = var.region
 }
 
+# ============================================================================
+# NOTE: Before running this, create IAM roles by running:
+# cd infra/iam-setup && terraform init && terraform apply -auto-approve
+# This creates GitHub Actions OIDC role and Lambda execution role
+# ============================================================================
+
 # S3 bucket for ML artifacts & RAG docs
 resource "aws_s3_bucket" "ml_artifacts" {
   bucket = var.ml_artifacts_bucket

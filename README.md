@@ -2,7 +2,11 @@
 
 A comprehensive reference project combining **AI-powered DevOps assistance**, **ML model training pipelines**, and **Retrieval-Augmented Generation (RAG)** on AWS.
 
-## Project Overview
+## 🚀 Quick Start
+
+**Read [START_HERE.md](./START_HERE.md) for complete setup & deployment guide** ← This is your one-stop guide for everything!
+
+## What This Project Does
 
 This repository demonstrates integration of three AI/DevOps capabilities:
 
