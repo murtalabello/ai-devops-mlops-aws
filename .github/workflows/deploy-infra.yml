@@ -1,0 +1,85 @@
+name: Deploy Infrastructure
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - prod
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy-infra:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.5.0
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+      
+      - name: Terraform Init
+        run: |
+          cd infra
+          terraform init
+      
+      - name: Terraform Plan
+        run: |
+          cd infra
+          terraform plan -var-file="environments/${{ github.event.inputs.environment }}.tfvars" -out=tfplan
+      
+      - name: Terraform Apply
+        run: |
+          cd infra
+          terraform apply -auto-approve tfplan
+      
+      - name: Get Terraform Outputs
+        id: outputs
+        run: |
+          cd infra
+          echo "lambda_role_arn=$(terraform output -raw lambda_role_arn)" >> $GITHUB_OUTPUT
+          echo "ml_bucket=$(terraform output -raw ml_artifacts_bucket)" >> $GITHUB_OUTPUT
+          echo "rag_bucket=$(terraform output -raw rag_docs_bucket)" >> $GITHUB_OUTPUT
+          echo "rag_table=$(terraform output -raw rag_table_name)" >> $GITHUB_OUTPUT
+      
+      - name: Save outputs to GitHub environment
+        run: |
+          echo "LAMBDA_ROLE_ARN=${{ steps.outputs.outputs.lambda_role_arn }}" >> $GITHUB_ENV
+          echo "ML_BUCKET=${{ steps.outputs.outputs.ml_bucket }}" >> $GITHUB_ENV
+          echo "RAG_BUCKET=${{ steps.outputs.outputs.rag_bucket }}" >> $GITHUB_ENV
+          echo "RAG_TABLE=${{ steps.outputs.outputs.rag_table }}" >> $GITHUB_ENV
+      
+      - name: Slack notification
+        uses: slackapi/slack-github-action@v1.24.0
+        if: always()
+        with:
+          webhook-url: ${{ secrets.SLACK_WEBHOOK }}
+          payload: |
+            {
+              "text": "${{ job.status == 'success' && '✅' || '❌' }} Infrastructure deployment to ${{ github.event.inputs.environment }}",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "Status: ${{ job.status }}\nLambda Role: ${{ steps.outputs.outputs.lambda_role_arn }}\nML Bucket: ${{ steps.outputs.outputs.ml_bucket }}\nRAG Bucket: ${{ steps.outputs.outputs.rag_bucket }}"
+                  }
+                }
+              ]
+            }

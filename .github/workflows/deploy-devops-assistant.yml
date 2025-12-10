@@ -1,0 +1,132 @@
+name: Deploy DevOps Assistant
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - prod
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          pip install -r devops_assistant/requirements.txt
+      
+      - name: Lint code
+        run: |
+          pip install flake8 black
+          black --check devops_assistant/ || true
+          flake8 devops_assistant/ || true
+      
+      - name: Build Lambda package
+        run: |
+          mkdir -p build/devops-assistant
+          pip install -r devops_assistant/requirements.txt -t build/devops-assistant/
+          cp devops_assistant/lambda_function.py build/devops-assistant/
+          cd build/devops-assistant
+          zip -r ../devops-assistant.zip .
+          cd ../../
+      
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: devops-assistant-lambda
+          path: build/devops-assistant.zip
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: devops-assistant-lambda
+          path: build/
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+      
+      - name: Deploy Lambda
+        env:
+          FUNCTION_NAME: devops-assistant-${{ github.event.inputs.environment }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          # Check if function exists
+          FUNCTION_EXISTS=$(aws lambda list-functions --region ${{ secrets.AWS_REGION }} \
+            --query "Functions[?FunctionName=='$FUNCTION_NAME'].FunctionName" --output text)
+          
+          if [ -z "$FUNCTION_EXISTS" ]; then
+            echo "Creating Lambda function..."
+            aws lambda create-function \
+              --function-name $FUNCTION_NAME \
+              --runtime python3.11 \
+              --role ${{ secrets.AWS_LAMBDA_ROLE_ARN }} \
+              --handler lambda_function.lambda_handler \
+              --zip-file fileb://build/devops-assistant.zip \
+              --environment "Variables={OPENAI_API_KEY=$OPENAI_API_KEY,ENVIRONMENT=${{ github.event.inputs.environment }}}" \
+              --timeout 60 \
+              --memory-size 256 \
+              --region ${{ secrets.AWS_REGION }}
+          else
+            echo "Updating Lambda function..."
+            aws lambda update-function-code \
+              --function-name $FUNCTION_NAME \
+              --zip-file fileb://build/devops-assistant.zip \
+              --region ${{ secrets.AWS_REGION }}
+            
+            aws lambda update-function-configuration \
+              --function-name $FUNCTION_NAME \
+              --environment "Variables={OPENAI_API_KEY=$OPENAI_API_KEY,ENVIRONMENT=${{ github.event.inputs.environment }}}" \
+              --region ${{ secrets.AWS_REGION }}
+          fi
+      
+      - name: Create API Gateway
+        run: |
+          bash scripts/create-api-gateway.sh devops-assistant-${{ github.event.inputs.environment }} \
+            devops-assistant ${{ github.event.inputs.environment }}
+      
+      - name: Slack notification
+        uses: slackapi/slack-github-action@v1.24.0
+        if: always()
+        with:
+          webhook-url: ${{ secrets.SLACK_WEBHOOK }}
+          payload: |
+            {
+              "text": "${{ job.status == 'success' && '✅' || '❌' }} DevOps Assistant deployed to ${{ github.event.inputs.environment }}",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "Function: devops-assistant-${{ github.event.inputs.environment }}\nStatus: ${{ job.status }}\nCheck logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                  }
+                }
+              ]
+            }

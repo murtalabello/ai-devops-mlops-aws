@@ -2,6 +2,15 @@ name: MLOps - Train & Deploy Model
 
 on:
   workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy'
+        required: true
+        default: 'prod'
+        type: choice
+        options:
+          - dev
+          - prod
   schedule:
     - cron: "0 3 * * *" # Daily at 03:00 UTC
 
@@ -55,10 +64,12 @@ jobs:
           aws-region: ${{ secrets.AWS_REGION }}
       
       - name: Upload model to S3
+        env:
+          ENVIRONMENT: ${{ github.event.inputs.environment || 'prod' }}
         run: |
           cd $(find . -name "model-artifacts-*" -type d | head -1)
-          aws s3 cp model.pkl s3://${{ secrets.ML_ARTIFACTS_BUCKET }}/models/model-$(date +%Y%m%d_%H%M%S).pkl
-          aws s3 cp metrics.txt s3://${{ secrets.ML_ARTIFACTS_BUCKET }}/metrics/metrics-$(date +%Y%m%d_%H%M%S).txt
+          aws s3 cp model.pkl s3://${{ secrets.ML_ARTIFACTS_BUCKET }}/models/model-${ENVIRONMENT}-$(date +%Y%m%d_%H%M%S).pkl
+          aws s3 cp metrics.txt s3://${{ secrets.ML_ARTIFACTS_BUCKET }}/metrics/metrics-${ENVIRONMENT}-$(date +%Y%m%d_%H%M%S).txt
       
       - name: Update SageMaker Model (optional)
         if: false  # Enable when using SageMaker

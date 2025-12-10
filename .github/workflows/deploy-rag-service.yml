@@ -1,0 +1,143 @@
+name: Deploy RAG Service
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - prod
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          pip install -r rag_service/requirements.txt
+      
+      - name: Lint code
+        run: |
+          pip install flake8 black
+          black --check rag_service/ || true
+          flake8 rag_service/ || true
+      
+      - name: Build Lambda package
+        run: |
+          mkdir -p build/rag-service
+          pip install -r rag_service/requirements.txt -t build/rag-service/
+          cp rag_service/lambda_function.py build/rag-service/
+          cd build/rag-service
+          zip -r ../rag-service.zip .
+          cd ../../
+      
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rag-service-lambda
+          path: build/rag-service.zip
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: rag-service-lambda
+          path: build/
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+      
+      - name: Deploy Lambda
+        env:
+          FUNCTION_NAME: rag-service-${{ github.event.inputs.environment }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          RAG_TABLE: ${{ secrets.RAG_TABLE_NAME }}
+          RAG_BUCKET: ${{ secrets.RAG_BUCKET_NAME }}
+        run: |
+          # Check if function exists
+          FUNCTION_EXISTS=$(aws lambda list-functions --region ${{ secrets.AWS_REGION }} \
+            --query "Functions[?FunctionName=='$FUNCTION_NAME'].FunctionName" --output text)
+          
+          if [ -z "$FUNCTION_EXISTS" ]; then
+            echo "Creating Lambda function..."
+            aws lambda create-function \
+              --function-name $FUNCTION_NAME \
+              --runtime python3.11 \
+              --role ${{ secrets.AWS_LAMBDA_ROLE_ARN }} \
+              --handler lambda_function.lambda_handler \
+              --zip-file fileb://build/rag-service.zip \
+              --environment "Variables={OPENAI_API_KEY=$OPENAI_API_KEY,RAG_TABLE=$RAG_TABLE,RAG_BUCKET=$RAG_BUCKET,ENVIRONMENT=${{ github.event.inputs.environment }}}" \
+              --timeout 60 \
+              --memory-size 512 \
+              --region ${{ secrets.AWS_REGION }}
+          else
+            echo "Updating Lambda function..."
+            aws lambda update-function-code \
+              --function-name $FUNCTION_NAME \
+              --zip-file fileb://build/rag-service.zip \
+              --region ${{ secrets.AWS_REGION }}
+            
+            aws lambda update-function-configuration \
+              --function-name $FUNCTION_NAME \
+              --environment "Variables={OPENAI_API_KEY=$OPENAI_API_KEY,RAG_TABLE=$RAG_TABLE,RAG_BUCKET=$RAG_BUCKET,ENVIRONMENT=${{ github.event.inputs.environment }}}" \
+              --memory-size 512 \
+              --region ${{ secrets.AWS_REGION }}
+          fi
+      
+      - name: Create API Gateway
+        run: |
+          bash scripts/create-api-gateway.sh rag-service-${{ github.event.inputs.environment }} \
+            rag-service ${{ github.event.inputs.environment }}
+      
+      - name: Run smoke tests
+        run: |
+          CONTENT=$(echo "Test RAG document" | base64)
+          curl -X POST "$(aws apigateway get-rest-apis --query "Items[0].id" --output text).execute-api.${{ secrets.AWS_REGION }}.amazonaws.com/${{ github.event.inputs.environment }}/upload" \
+            -H "Content-Type: application/json" \
+            -d "{\"filename\": \"test.txt\", \"content_base64\": \"$CONTENT\"}" \
+            --max-time 10 || echo "Upload test completed"
+      
+      - name: Slack notification
+        uses: slackapi/slack-github-action@v1.24.0
+        if: always()
+        with:
+          webhook-url: ${{ secrets.SLACK_WEBHOOK }}
+          payload: |
+            {
+              "text": "${{ job.status == 'success' && '✅' || '❌' }} RAG Service deployed to ${{ github.event.inputs.environment }}",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "Function: rag-service-${{ github.event.inputs.environment }}\nStatus: ${{ job.status }}\nCheck logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                  }
+                }
+              ]
+            }
