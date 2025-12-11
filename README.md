@@ -26,7 +26,20 @@ Check these boxes:
 - [ ] You have Terraform installed on your computer
 - [ ] You have an OpenAI API key (get free credits at https://platform.openai.com/api-keys)
 
-**Don't have AWS CLI?** [Install it here](https://aws.amazon.com/cli/)
+**Don't have AWS CLI?**
+
+For Windows (recommended): run the bundled installer script in this repo using an elevated PowerShell session — this automates the download and install.
+
+1. Open PowerShell as Administrator (right-click → Run as administrator)
+2. Run these commands (copy & paste):
+
+```powershell
+Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope Process -Force
+cd "C:\Users\murta\OneDrive\projects\ai-devops-mlops-aws\infra"
+.\install_aws_cli.ps1
+```
+
+If you prefer the official installer or a different OS, see: https://aws.amazon.com/cli/
 
 **Don't have Terraform?** [Install it here](https://www.terraform.io/downloads.html)
 
